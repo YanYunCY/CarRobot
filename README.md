@@ -1,4 +1,217 @@
-中国大学生机器人智能创意竞赛机器人对抗赛A组无人对撞小车代码部分，以及一部分结构和硬件部分。
+中国大学生机器人智能创意竞赛机器人对抗赛A组无人对撞小车代码部分，以及一部分结构和硬件部分。Vscode和Keli两种编译器均可编译.
+
+# STM32 对战机器人工程说明
+
+## 1. 项目概述
+
+基于 STM32F427VGT6 的自主对战机器人，采用裸机（无 RTOS）架构，通过 8 路红外传感器 + K230 摄像头实现目标检测与追踪，使用 PID 控制差速驱动完成自主攻击、巡逻、避障等行为。
+
+## 2. 硬件平台
+
+| 模块 | 型号/参数 |
+|------|-----------|
+| MCU | STM32F427VGT6 (Cortex-M4, 180MHz) |
+| 电机 | M3602 有刷电机 (22.2V) |
+| 电调 | S2412 (PWM 控制) |
+| 红外传感器 | 8 路 IR 测距 (5-80cm) |
+| 摄像头 | K230 (160×120, AprilTag 检测) |
+| 边缘传感器 | 2 路光电开关 (PD12/PD13) |
+
+## 3. 工程目录结构
+
+```
+Car_Test/
+├── Core/
+│   ├── Inc/              # HAL 外设头文件
+│   └── Src/              # HAL 外设实现 + main.c
+├── Components/BSP/       # 自定义驱动层
+│   ├── system.c/h        # 主状态机 & 战斗逻辑
+│   ├── motor.c/h         # 电机 PWM 控制
+│   ├── sensor.c/h        # IR 传感器 ADC 采集
+│   ├── camera.c/h        # K230 摄像头 UART 通信
+│   ├── edge.c/h          # 边缘检测 & 防跌落
+│   ├── pid.c/h           # PID 控制器
+│   ├── recover.c/h       # 跌落恢复逻辑
+│   └── BSP_USART.c/h     # 串口 printf 重定向
+├── Drivers/              # STM32 HAL & CMSIS 库
+├── K230_Code/            # K230 摄像头端 Python 代码
+└── STM32F427VGT6.ioc    # CubeMX 工程文件
+```
+
+## 4. 外设分配
+
+| 外设 | 用途 | 配置 |
+|------|------|------|
+| UART1 | 调试串口 | 115200, 中断接收 |
+| UART3 | K230 摄像头通信 | 115200, DMA + IDLE 中断 |
+| TIM3 CH1/CH2 | 电机 PWM 输出 | PSC=900, ARR=2000 (~100Hz) |
+| TIM8 | 1ms 定时中断 | 触发 ADC 采样 |
+| ADC1 (4ch) | IR 传感器 0-3 | DMA 循环采集 |
+| ADC2 (4ch) | IR 传感器 4-7 | DMA 循环采集 |
+| GPIO PD12/PD13 | 边缘光电开关 | EXTI 中断 + 10ms 消抖 |
+
+## 5. 系统初始化流程图
+
+```mermaid
+graph TD
+    A[上电复位] --> B[HAL_Init]
+    B --> C[SystemClock_Config<br/>HSE 8MHz → PLL 180MHz]
+    C --> D[外设初始化]
+    D --> D1[GPIO_Init]
+    D --> D2[DMA_Init]
+    D --> D3[USART1/3_Init]
+    D --> D4[ADC1/2_Init]
+    D --> D5[TIM3/8_Init]
+    D1 & D2 & D3 & D4 & D5 --> E[启动外设]
+    E --> E1[UART3 DMA+IDLE 接收]
+    E --> E2[TIM3 PWM 输出]
+    E --> E3[TIM8 定时中断]
+    E --> E4[ADC1/2 DMA 采集]
+    E1 & E2 & E3 & E4 --> F[电机停止信号<br/>run stop, 0]
+    F --> G[延时 2s 等待电调初始化]
+    G --> H[recover_init 恢复模块初始化]
+    H --> I[进入主循环<br/>while 1: system_update]
+```
+
+## 6. 主循环状态机流程图
+
+```mermaid
+graph TD
+    START[system_update] --> ESC{逃跑模式?}
+    ESC -->|是| ESC_ACT[前进 + 边缘保护<br/>持续 2s]
+    ESC -->|否| INIT{已初始化?}
+    
+    INIT -->|否| INIT_ACT[检测左右传感器<br/>选择目标 QR ID]
+    INIT -->|是| STAGE{在台上?}
+    
+    STAGE -->|否| OFF[SYS_OFF_STAGE<br/>后退上台]
+    OFF --> CLIMB[SYS_CLIMB<br/>后退 45 速度 800ms]
+    CLIMB --> PATROL_STATE
+
+    STAGE -->|是| STATE{当前状态}
+    
+    STATE -->|SYS_PATROL| PATROL_STATE[巡逻模式]
+    STATE -->|SYS_TRACK_QR| QR_STATE[QR 追踪模式]
+    STATE -->|SYS_ATTACK| ATK_STATE[攻击模式]
+
+    PATROL_STATE --> P1[edge_update 边缘避让]
+    P1 --> P2{检测到 QR?}
+    P2 -->|是| QR_STATE
+    P2 -->|否| P3{检测到目标?}
+    P3 -->|是| ATK_STATE
+    P3 -->|否| P4[继续巡逻前进]
+
+    QR_STATE --> Q1{是目标 QR?}
+    Q1 -->|否| Q2[后退 + 转向避让]
+    Q1 -->|是| Q3{宽度 >= 40px?}
+    Q3 -->|是| Q4[推进模式<br/>前进 15 速度]
+    Q3 -->|否| Q5[PID 跟踪<br/>差速转向 + 前进]
+
+    ATK_STATE --> A1{后方有威胁?}
+    A1 -->|是| A2[转向远离]
+    A1 -->|否| A3{误差大?}
+    A3 -->|是| A4[原地旋转对准]
+    A3 -->|否| A5{距离 < 20cm?}
+    A5 -->|是| A6[推进模式]
+    A5 -->|否| A7[PID 跟踪 + 速度缩放]
+```
+
+## 7. 数据流图
+
+```mermaid
+graph LR
+    subgraph 传感器层
+        IR[8路 IR 传感器] -->|ADC DMA| BUF[10 采样环形缓冲]
+        EDGE_S[2路边缘光电] -->|GPIO EXTI| EDGE_F[边缘标志]
+        CAM[K230 摄像头] -->|UART3 DMA| PARSE[帧解析<br/>$x,y,w,h,id,rot#]
+    end
+
+    subgraph 数据处理层
+        BUF --> AVG[滑动平均滤波]
+        AVG --> LPF[一阶低通滤波<br/>0.7*old + 0.3*new]
+        LPF --> DIST[距离值 0-7]
+        PARSE --> CAM_INFO[CameraInfo<br/>x, w, id, valid]
+    end
+
+    subgraph 决策层
+        DIST --> DET_T[detect_target<br/>加权平均]
+        DIST --> DET_S[detect_on_stage<br/>台面检测]
+        CAM_INFO --> DET_Q[detect_qr<br/>QR 检测]
+        EDGE_F --> EDGE_U[edge_update<br/>边缘状态机]
+        DET_T & DET_S & DET_Q & EDGE_U --> SM[主状态机<br/>system_update]
+    end
+
+    subgraph 执行层
+        SM --> PID_C[Camera PID<br/>Kp=0.75]
+        SM --> PID_T[Target PID<br/>Kp=3.0]
+        PID_C & PID_T --> MOT[motor 差速控制]
+        MOT -->|TIM3 PWM| ESC_HW[S2412 电调]
+        ESC_HW --> MOTOR_HW[M3602 电机]
+    end
+```
+
+## 8. 中断服务流程
+
+```mermaid
+graph TD
+    subgraph TIM8 中断 - 1ms
+        T8[TIM8 溢出] --> ADC_START[触发 ADC1/ADC2 转换]
+    end
+
+    subgraph ADC DMA 完成
+        ADC_DONE[DMA 传输完成] --> FILL[填充环形缓冲区]
+        FILL --> IDX[缓冲索引 +1]
+    end
+
+    subgraph UART3 IDLE 中断
+        IDLE[UART3 空闲检测] --> CALC[计算 DMA 接收长度]
+        CALC --> CB[UART3_RX_Callback]
+        CB --> PARSE_F[解析帧数据]
+        PARSE_F --> UPDATE[更新 CameraInfo]
+        UPDATE --> RESTART[重启 DMA 接收]
+    end
+
+    subgraph GPIO EXTI 中断
+        EXTI[PD12/PD13 触发] --> DEBOUNCE{消抖 > 10ms?}
+        DEBOUNCE -->|是| SET[设置边缘触发标志]
+        DEBOUNCE -->|否| IGNORE[忽略]
+    end
+```
+
+## 9. 边缘检测状态机
+
+```mermaid
+graph LR
+    RUN[STATE_RUN<br/>正常前进] -->|左边缘触发| BACK_R[STATE_BACK<br/>后退]
+    RUN -->|右边缘触发| BACK_L[STATE_BACK<br/>后退]
+    BACK_R --> TURN_R[STATE_TURN<br/>右转 250ms]
+    BACK_L --> TURN_L[STATE_TURN<br/>左转 250ms]
+    TURN_R --> RUN
+    TURN_L --> RUN
+```
+
+## 10. 关键参数一览
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| CAMERA_IMAGE_WIDTH | 160 | AprilTag 图像宽度 |
+| CAMERA_PID_DEADZONE | 8 | 跟踪软死区 (像素) |
+| TARGET_THRESHOLD | 40cm | IR 目标检测距离 |
+| EDGE_TURN_MS | 250ms | 边缘避让转向时间 |
+| RECOVER_HOLD_MS | 800ms | 跌落恢复保持时间 |
+| ESCAPE_DURATION | 2000ms | 逃跑模式持续时间 |
+| Camera PID | Kp=0.75, Ki=0.01, Kd=0.2 | AprilTag 跟踪 PID |
+| Target PID | Kp=3.0, Ki=0.0, Kd=1.2 | 红外目标跟踪 PID |
+| PWM 基准值 | 150 | 电调中位值 (100-200) |
+
+## 11. K230 摄像头通信协议
+
+**帧格式**: `$x,y,w,h,id,rotation#`
+
+- `$` 帧头, `#` 帧尾
+- 逗号分隔的 6 个字段
+- STM32 端提取 `x`(位置), `w`(宽度), `id`(AprilTag ID)
+- 有效期 100ms，超时标记为无效
 
 
 **摘 要**
